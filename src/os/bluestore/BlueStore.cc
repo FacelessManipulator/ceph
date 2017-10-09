@@ -4390,13 +4390,11 @@ int BlueStore::_open_bdev_fast(bool create)
   block_mask = ~(block_size - 1);
   block_size_order = ctz(block_size);
   assert(block_size == 1u << block_size_order);
-#if 0
   // and set cache_size based on device type
   r = _set_cache_sizes();
   if (r < 0) {
     goto fail_close;
   }
-#endif
   return 0;
 
  fail_close:
@@ -8877,9 +8875,7 @@ void BlueStore::_kv_sync_thread()
 		 << " force_flush=" << (int)force_flush
 		 << ", flushing, deferred done->stable" << dendl;
 	// flush/barrier on block device
-#if 1
 	bdev->flush();
-#endif
 
 	// if we flush then deferred done are now deferred stable
 	deferred_stable.insert(deferred_stable.end(), deferred_done.begin(),
@@ -9209,9 +9205,7 @@ void BlueStore::_deferred_submit_unlock(OpSequencer *osr)
 	if (!g_conf->bluestore_debug_omit_block_device_write) {
 	  logger->inc(l_bluestore_deferred_write_ops);
 	  logger->inc(l_bluestore_deferred_write_bytes, bl.length());
-#if 1
 	  int r = bdev->aio_write(start, bl, &b->ioc, false);
-#endif
 	  assert(r == 0);
 	}
       }
@@ -9232,9 +9226,7 @@ void BlueStore::_deferred_submit_unlock(OpSequencer *osr)
     bl.claim_append(i->second.bl);
     ++i;
   }
-#if 1
   bdev->aio_submit(&b->ioc);
-#endif
 }
 
 struct C_DeferredTrySubmit : public Context {
@@ -9429,9 +9421,7 @@ int BlueStore::queue_transactions(
 void BlueStore::_txc_aio_submit(TransContext *txc)
 {
   dout(10) << __func__ << " txc " << txc << dendl;
-#if 1
   bdev->aio_submit(&txc->ioc);
-#endif
 }
 
 void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
@@ -10032,7 +10022,7 @@ void BlueStore::_do_write_small(
 			      wctx->buffered ? 0 : Buffer::FLAG_NOCACHE);
 
 	  if (!g_conf->bluestore_debug_omit_block_device_write) {
-	    if (b_len <= prefer_deferred_size) {
+	    if (b_len <= prefer_deferred_size && bdev_target == bdev) {
 	      dout(20) << __func__ << " deferring small 0x" << std::hex
 		       << b_len << std::dec << " unused write via deferred" << dendl;
 	      bluestore_deferred_op_t *op = _get_deferred_op(txc, o);
@@ -10581,7 +10571,7 @@ int BlueStore::_do_alloc_write(
 
     // queue io
     if (!g_conf->bluestore_debug_omit_block_device_write) {
-      if (l->length() <= prefer_deferred_size.load()) {
+      if (l->length() <= prefer_deferred_size.load() && bdev_target == bdev) {
 	dout(20) << __func__ << " deferring small 0x" << std::hex
 		 << l->length() << std::dec << " write via deferred" << dendl;
 	bluestore_deferred_op_t *op = _get_deferred_op(txc, o);
