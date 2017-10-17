@@ -1,4 +1,1 @@
-ceph-disk
-=========
-
-ceph-disk is a command line tool that manages Ceph OSD storage
+/home/miller/workspace/ceph/src/ceph-disk/README.rst
