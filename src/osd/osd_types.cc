@@ -1528,7 +1528,12 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     ::encode(read_tier, bl);
     ::encode(write_tier, bl);
     ::encode(properties, bl);
-    ::encode(hit_set_params, bl);
+    if (!(features & CEPH_FEATURE_NEW_OSD_PROXY_TEMP_TRACK) &&
+        hit_set_params.get_type() == HitSet::TYPE_TEMP) {
+      ::encode(new HitSet::Params(nullptr), bl);
+    } else {
+      ::encode(hit_set_params, bl);
+    }
     ::encode(hit_set_period, bl);
     ::encode(hit_set_count, bl);
     ::encode(stripe_width, bl);
@@ -4262,7 +4267,7 @@ void object_copy_cursor_t::generate_test_instances(list<object_copy_cursor_t*>& 
 
 void object_copy_data_t::encode(bufferlist& bl, uint64_t features) const
 {
-  ENCODE_START(8, 5, bl);
+  ENCODE_START(9, 5, bl);
   ::encode(size, bl);
   ::encode(mtime, bl);
   ::encode(attrs, bl);
@@ -4279,6 +4284,8 @@ void object_copy_data_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(truncate_seq, bl);
   ::encode(truncate_size, bl);
   ::encode(extents, bl);
+  if ((flags & FLAG_TEMPERATURE) == FLAG_TEMPERATURE)
+    ::encode(temp, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -4342,6 +4349,10 @@ void object_copy_data_t::decode(bufferlist::iterator& bl)
     }
     if (struct_v >= 8) {
       ::decode(extents, bl);
+    }
+    if (struct_v >= 9 &&
+      (flags & FLAG_TEMPERATURE) == FLAG_TEMPERATURE) {
+      ::decode(temp, bl);
     }
   }
   DECODE_FINISH(bl);

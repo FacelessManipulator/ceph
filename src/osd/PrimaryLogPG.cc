@@ -2171,8 +2171,28 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
         in_hit_set = true;
     }
     if (!op->hitset_inserted) {
-      hit_set->insert(oid);
       op->hitset_inserted = true;
+      if (hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+        TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+        if (!obc || !obc->obs.exists)
+          th->evict(oid);
+        else if (pool.info.is_tier())
+          th->insert(oid, true);
+        else
+          th->insert(oid, true);
+        th->update();
+        uint64_t cache_hit_micro = th->get_cache_hit_micro();
+        dout(20) << __func__ << ": TempHitSet hit "  << oid
+          << " temp: " << th->get_temp(oid)
+          << " TempHitSet Stats["
+          << " average temp: " << th->get_avg_temp()
+          << ", decay periods: " << th->decay_period
+          << ", hit/miss: " << th->cache_hit << "/" << th->count - th->cache_hit
+          << ", hit rate" << (float)cache_hit_micro / 1000000
+          << " ]" << dendl;
+      } else {
+        hit_set->insert(oid);
+      }
       if (hit_set->is_full() ||
           hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {
         hit_set_persist();
@@ -2421,6 +2441,12 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
   if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE)
     return cache_result_t::NOOP;
 
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK &&
+      pool.info.write_tier >= 0) {
+    maybe_request_promote(obc, op);
+    return cache_result_t::NOOP;
+  }
+
   if (op &&
       op->get_req() &&
       op->get_req()->get_type() == CEPH_MSG_OSD_OP &&
@@ -2607,6 +2633,25 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
     // If it is a read, we can read, we need to proxy it
     do_proxy_read(op);
     return cache_result_t::HANDLED_PROXY;
+
+    case pg_pool_t::CACHEMODE_TEMPTRACK:
+      if (!must_promote) {
+        if (op->may_write() || op->may_cache() || write_ordered) {
+          do_proxy_write(op);
+          return cache_result_t::HANDLED_PROXY;
+        } else {
+          do_proxy_read(op);
+          return cache_result_t::HANDLED_PROXY;
+        }
+      }
+      if (agent_state &&
+        agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
+        dout(20) << __func__ << " cache pool full, waiting" << dendl;
+        block_write_on_full_cache(missing_oid, op);
+        return cache_result_t::BLOCKED_FULL;
+      }
+      promote_object(obc, missing_oid, oloc, op, promote_obc);
+      return cache_result_t::BLOCKED_PROMOTE;
 
   default:
     assert(0 == "unrecognized cache_mode");
@@ -3125,6 +3170,26 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
   if (op)
     wait_for_blocked_object(obc->obs.oi.soid, op);
   info.stats.stats.sum.num_promote++;
+}
+
+void PrimaryLogPG::maybe_request_promote(ObjectContextRef obc,
+    OpRequestRef op) {
+  if (!obc ||
+      pool.info.is_tier() ||
+      pool.info.cache_mode != pg_pool_t::CACHEMODE_TEMPTRACK ||
+      !hit_set || hit_set->impl->get_type() != HitSet::TYPE_TEMP)
+    return;
+  const MOSDOp *m = static_cast<const MOSDOp*>(op->get_req());
+  const object_locator_t oloc = m->get_object_locator();
+  hobject_t hoid = obc->obs.oi.soid;
+  TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+  uint32_t temp = th->get_temp(hoid);
+  if (temp > 2) {
+    ObjectOperation op;
+    op.cache_try_promote(temp, &(th->baseline), NULL);
+    osd->objecter->read(hoid.oid, oloc, op, hoid.snap, NULL, 0, NULL);
+      //TODO: continuing
+  }
 }
 
 void PrimaryLogPG::execute_ctx(OpContext *ctx)
@@ -5234,6 +5299,43 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  if (result == -EINPROGRESS)
 	    result = -EAGAIN;
 	} else {
+	  result = 0;
+	}
+      }
+      break;
+
+    case CEPH_OSD_OP_CACHE_TRY_PROMOTE:
+      ++ctx->num_write;
+      {
+	tracepoint(osd, do_osd_op_pre_try_promote, soid.oid.name.c_str(), soid.snap.val);
+	if (pool.info.cache_mode != pg_pool_t::CACHEMODE_TEMPTRACK ||
+      !pool.info.is_tier()) {
+	  result = -EINVAL;
+	  break;
+	}
+	if (obs.exists) {
+	  result = 0;
+	  break;
+	}
+  
+	uint32_t temp;
+	try {
+	  ::decode(temp, bp);
+	}
+	catch (buffer::error& e) {
+	  result = -EINVAL;
+	  goto fail;
+	}
+	//agent_state->temp_hist.get_position_micro(temp, &temp_lower, &temp_upper);
+	if (temp > 2) {
+	  ::encode(2, osd_op.outdata);
+    dout(0) << __func__ << "try promoting object with temp " << temp << dendl;
+	  const MOSDOp *m = static_cast<const MOSDOp *>(ctx->op->get_req());
+	  const object_locator_t oloc = m->get_object_locator();
+	  promote_object(ctx->obc, soid, oloc, ctx->op, nullptr);
+	  result = -EAGAIN;
+	} else {
+	  ::encode(3, osd_op.outdata);
 	  result = 0;
 	}
       }
@@ -7683,7 +7785,7 @@ int PrimaryLogPG::do_copy_get(OpContext *ctx, bufferlist::iterator& bp,
     cb = new C_CopyFrom_AsyncReadCb(&osd_op, features);
   }
   object_copy_data_t &reply_obj = cb ? cb->reply_obj : _reply_obj;
-  // size, mtime
+  // size, mtime, temperature
   reply_obj.size = oi.size;
   reply_obj.mtime = oi.mtime;
   assert(obc->ssc);
@@ -7704,6 +7806,12 @@ int PrimaryLogPG::do_copy_get(OpContext *ctx, bufferlist::iterator& bp,
   }
   reply_obj.truncate_seq = oi.truncate_seq;
   reply_obj.truncate_size = oi.truncate_size;
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK &&
+      hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+    TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+    reply_obj.flags |= object_copy_data_t::FLAG_TEMPERATURE;
+    reply_obj.temp = th->get_temp(soid);
+  }
 
   // attrs
   map<string,bufferlist>& out_attrs = reply_obj.attrs;
@@ -7922,7 +8030,7 @@ void PrimaryLogPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
     assert(cop->cursor.is_initial());
   }
   op.copy_get(&cop->cursor, get_copy_chunk_size(),
-	      &cop->results.object_size, &cop->results.mtime,
+	      &cop->results.object_size, &cop->results.mtime, &cop->results.temp,
 	      &cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
 	      &cop->results.snaps, &cop->results.snap_seq,
 	      &cop->results.flags,
@@ -8496,6 +8604,16 @@ void PrimaryLogPG::finish_promote(int r, CopyResults *results,
   simple_opc_submit(std::move(tctx));
 
   osd->logger->inc(l_osd_tier_promote);
+
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+      TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+      if (results->has_temperature())
+        th->set_temp(soid, results->temp);
+      else
+        th->set_temp(soid, th->baseline);
+    }
+  }
 
   if (agent_state &&
       agent_state->is_idle())
@@ -10836,7 +10954,7 @@ void PrimaryLogPG::on_activate()
 	     << dendl;
     }
   }
-
+  //maybe_cachemode_temptrack();
   hit_set_setup();
   agent_setup();
 }
@@ -10983,6 +11101,7 @@ void PrimaryLogPG::on_pool_change()
     requeue_ops(waiting_for_cache_not_full);
     objects_blocked_on_cache_full.clear();
   }
+  //maybe_cachemode_temptrack();
   hit_set_setup();
   agent_setup();
 }
@@ -12237,6 +12356,32 @@ void PrimaryLogPG::check_local()
   }
 }
 
+bool PrimaryLogPG::maybe_cachemode_temptrack()
+{
+  if (pool.info.cache_mode != pg_pool_t::CACHEMODE_TEMPTRACK &&
+    pool.info.write_tier < 0)
+    return false;
+
+  OSDMapRef osdmap = get_osdmap();
+
+  const pg_pool_t* write_tier = osdmap->get_pg_pool(pool.info.write_tier);
+  if (write_tier && write_tier->cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    pool.info.cache_mode = pg_pool_t::CACHEMODE_TEMPTRACK;
+    dout(20) << __func__ << "base pool: " << pool.name
+      << " initialize TEMPTRACK cachemode for"
+      << " its write tier: " << osdmap->get_pool_name(pool.info.write_tier)
+      << dendl;
+  }
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    TempHitSet::Params *bsp = new TempHitSet::Params;
+    bsp->set_dp(cct->_conf->osd_agent_hist_halflife);
+    pool.info.hit_set_count = 1;
+    pool.info.hit_set_period = UINT32_MAX;
+    pool.info.hit_set_params = HitSet::Params(bsp);
+    return true;
+  }
+  return false;
+}
 
 
 // ===========================
@@ -12304,7 +12449,8 @@ void PrimaryLogPG::hit_set_setup()
 
   // include any writes we know about from the pg log.  this doesn't
   // capture reads, but it is better than nothing!
-  hit_set_apply_log();
+  if (hit_set->impl->get_type() != HitSet::TYPE_TEMP)
+    hit_set_apply_log();
 }
 
 void PrimaryLogPG::hit_set_remove_all()
@@ -12383,10 +12529,25 @@ void PrimaryLogPG::hit_set_create()
 
     dout(10) << __func__ << " target_size " << p->target_size
 	     << " fpp " << p->get_fpp() << dendl;
+  } else if (pool.info.hit_set_params.get_type() == HitSet::TYPE_TEMP) {
+    if (!hit_set) {
+      // try loading the temp hit set in local storage first
+      hobject_t oid = get_hit_set_current_object(utime_t());
+      hit_set = hit_set_load(oid);
+    }
+    // No need to create a new temp_hit_set if cur temp_hit_set exist
+    if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+      TempHitSet* ht =
+        static_cast<TempHitSet*>(hit_set->impl.get());
+      ht->set_dp(cct->_conf->osd_agent_hist_halflife);
+      hit_set_start_stamp = now;
+      return;
+    }
   }
   hit_set.reset(new HitSet(params));
   hit_set_start_stamp = now;
 }
+
 
 /**
  * apply log entries to set
@@ -12427,20 +12588,6 @@ void PrimaryLogPG::hit_set_persist()
   utime_t now = ceph_clock_now();
   hobject_t oid;
 
-  // If any archives are degraded we skip this persist request
-  // account for the additional entry being added below
-  for (list<pg_hit_set_info_t>::iterator p = info.hit_set.history.begin();
-       p != info.hit_set.history.end();
-       ++p) {
-    hobject_t aoid = get_hit_set_archive_object(p->begin, p->end, p->using_gmt);
-
-    // Once we hit a degraded object just skip further trim
-    if (is_degraded_or_backfilling_object(aoid))
-      return;
-    if (scrubber.write_blocked_by_scrub(aoid))
-      return;
-  }
-
   // If backfill is in progress and we could possibly overlap with the
   // hit_set_* objects, back off.  Since these all have
   // hobject_t::hash set to pgid.ps(), and those sort first, we can
@@ -12461,30 +12608,61 @@ void PrimaryLogPG::hit_set_persist()
     }
   }
 
+  pg_hit_set_info_t new_hset(pool.info.use_gmt_hitset);
 
-  pg_hit_set_info_t new_hset = pg_hit_set_info_t(pool.info.use_gmt_hitset);
-  new_hset.begin = hit_set_start_stamp;
-  new_hset.end = now;
-  oid = get_hit_set_archive_object(
+  if (pool.info.hit_set_params.get_type() == HitSet::TYPE_TEMP) {
+    // the count of TempHitSet should be 1
+    max = 1;
+    hobject_t aoid = get_hit_set_current_object(utime_t());
+    if (is_degraded_or_backfilling_object(aoid))
+      return;
+    if (scrubber.write_blocked_by_scrub(aoid))
+      return;
+    new_hset.begin = hit_set_start_stamp;
+    new_hset.end = now;
+    oid = get_hit_set_current_object(utime_t());
+    // If the current object is degraded we skip this persist request
+    if (scrubber.write_blocked_by_scrub(oid))
+      return;
+    ::encode(*hit_set, bl);
+    dout(20) << __func__ << " archive " << oid << dendl;
+  } else {
+    // If any archives are degraded we skip this persist request
+    // account for the additional entry being added below
+    for (list<pg_hit_set_info_t>::iterator p = info.hit_set.history.begin();
+         p != info.hit_set.history.end();
+         ++p) {
+      hobject_t aoid = get_hit_set_archive_object(p->begin, p->end, p->using_gmt);
+
+      // Once we hit a degraded object just skip further trim
+      if (is_degraded_or_backfilling_object(aoid))
+        return;
+      if (scrubber.write_blocked_by_scrub(aoid))
+        return;
+    }
+
+    new_hset.begin = hit_set_start_stamp;
+    new_hset.end = now;
+    oid = get_hit_set_archive_object(
     new_hset.begin,
     new_hset.end,
     new_hset.using_gmt);
+    // If the current object is degraded we skip this persist request
+    if (scrubber.write_blocked_by_scrub(oid))
+      return;
 
-  // If the current object is degraded we skip this persist request
-  if (scrubber.write_blocked_by_scrub(oid))
-    return;
+    hit_set->seal();
+    ::encode(*hit_set, bl);
+    dout(20) << __func__ << " archive " << oid << dendl;
 
-  hit_set->seal();
-  ::encode(*hit_set, bl);
-  dout(20) << __func__ << " archive " << oid << dendl;
-
-  if (agent_state) {
-    agent_state->add_hit_set(new_hset.begin, hit_set);
-    uint32_t size = agent_state->hit_set_map.size();
-    if (size >= pool.info.hit_set_count) {
-      size = pool.info.hit_set_count > 0 ? pool.info.hit_set_count - 1: 0;
+    if (agent_state) {
+      agent_state->add_hit_set(new_hset.begin, hit_set);
+      uint32_t size = agent_state->hit_set_map.size();
+      if (size >= max) {
+        size = max > 0 ? max - 1: 0;
+      }
+      hit_set_in_memory_trim(size);
     }
-    hit_set_in_memory_trim(size);
   }
 
   ObjectContextRef obc = get_object_context(oid, true);
@@ -12545,9 +12723,48 @@ void PrimaryLogPG::hit_set_persist()
       0)
     );
 
-  hit_set_trim(ctx, max);
+  if (pool.info.hit_set_params.get_type() != HitSet::TYPE_TEMP)
+    hit_set_trim(ctx, max);
 
   simple_opc_submit(std::move(ctx));
+}
+
+HitSetRef PrimaryLogPG::hit_set_load(hobject_t& oid) {
+  if (!pool.info.is_replicated()) {
+    // FIXME: EC not supported here yet
+    derr << __func__ << " on non-replicated pool" << dendl;
+    return HitSetRef();
+  }
+
+  if (is_unreadable_object(oid)) {
+    dout(10) << __func__ << " unreadable " << oid << ", waiting" << dendl;
+    return HitSetRef();
+  }
+
+  ObjectContextRef obc = get_object_context(oid, false);
+  if (!obc) {
+    derr << __func__ << ": could not load hitset " << oid << dendl;
+    return HitSetRef();
+  }
+
+  int r;
+  bufferlist bl;
+  {
+    obc->ondisk_read_lock();
+    r = osd->store->read(ch, ghobject_t(oid), 0, 0, bl);
+    obc->ondisk_read_unlock();
+  }
+  if (r < 0)
+    return HitSetRef();
+  HitSetRef hs(new HitSet);
+  bufferlist::iterator pbl = bl.begin();
+  try {
+    ::decode(*hs, pbl);
+    return hs;
+  } catch (...) {
+    dout(0) << __func__ << ": error on loading hitset." << dendl;
+  }
+  return HitSetRef();
 }
 
 void PrimaryLogPG::hit_set_trim(OpContextUPtr &ctx, unsigned max)
@@ -12819,34 +13036,11 @@ void PrimaryLogPG::agent_load_hit_sets()
       if (agent_state->hit_set_map.count(p->begin.sec()) == 0) {
 	dout(10) << __func__ << " loading " << p->begin << "-"
 		 << p->end << dendl;
-	if (!pool.info.is_replicated()) {
-	  // FIXME: EC not supported here yet
-	  derr << __func__ << " on non-replicated pool" << dendl;
-	  break;
-	}
 
 	hobject_t oid = get_hit_set_archive_object(p->begin, p->end, p->using_gmt);
-	if (is_unreadable_object(oid)) {
-	  dout(10) << __func__ << " unreadable " << oid << ", waiting" << dendl;
+	HitSetRef hs = hit_set_load(oid);
+	if (!hs)
 	  break;
-	}
-
-	ObjectContextRef obc = get_object_context(oid, false);
-	if (!obc) {
-	  derr << __func__ << ": could not load hitset " << oid << dendl;
-	  break;
-	}
-
-	bufferlist bl;
-	{
-	  obc->ondisk_read_lock();
-	  int r = osd->store->read(ch, ghobject_t(oid), 0, 0, bl);
-	  assert(r >= 0);
-	  obc->ondisk_read_unlock();
-	}
-	HitSetRef hs(new HitSet);
-	bufferlist::iterator pbl = bl.begin();
-	::decode(*hs, pbl);
 	agent_state->add_hit_set(p->begin.sec(), hs);
       }
     }
@@ -13016,7 +13210,14 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   finish_ctx(ctx.get(), pg_log_entry_t::DELETE);
   simple_opc_submit(std::move(ctx));
   osd->logger->inc(l_osd_tier_evict);
-  osd->logger->inc(l_osd_agent_evict);
+  osd->logger->inc(l_osd_agent_evict);  
+
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+      TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+      th->evict(soid);
+    }
+  }
   return true;
 }
 

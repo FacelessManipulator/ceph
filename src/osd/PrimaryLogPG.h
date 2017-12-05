@@ -70,6 +70,7 @@ public:
    */
   struct CopyResults {
     ceph::real_time mtime; ///< the copy source's mtime
+    uint32_t temp;        ///< the copy source's temperature
     uint64_t object_size; ///< the copied object's size
     bool started_temp_obj; ///< true if the callback needs to delete temp object
     hobject_t temp_oid;    ///< temp object (if any)
@@ -104,6 +105,9 @@ public:
     }
     bool has_extents() {
       return flags & object_copy_data_t::FLAG_EXTENTS;
+    }
+    bool has_temperature() {
+      return flags & object_copy_data_t::FLAG_TEMPERATURE;
     }
     CopyResults()
       : object_size(0), started_temp_obj(false),
@@ -905,7 +909,9 @@ protected:
   void hit_set_clear();     ///< discard any HitSet state
   void hit_set_setup();     ///< initialize HitSet state
   void hit_set_create();    ///< create a new HitSet
+  bool hit_set_setup_base_temp();    ///< create a HitSet in basepool use TempHitSet
   void hit_set_persist();   ///< persist hit info
+  HitSetRef hit_set_load(hobject_t& oid); ///< load hitset by oid
   bool hit_set_apply_log(); ///< apply log entries to update in-memory HitSet
   void hit_set_trim(OpContextUPtr &ctx, unsigned max); ///< discard old HitSets
   void hit_set_in_memory_trim(uint32_t max_in_memory); ///< discard old in memory HitSets
@@ -946,6 +952,8 @@ protected:
   /// choose (new) agent mode(s), returns true if op is requeued
   bool agent_choose_mode(bool restart = false, OpRequestRef op = OpRequestRef());
   void agent_choose_mode_restart() override;
+
+  bool maybe_cachemode_temptrack();
 
   /// true if we can send an ondisk/commit for v
   bool already_complete(eversion_t v);
@@ -1201,6 +1209,14 @@ protected:
     const object_locator_t& oloc,    ///< locator for obc|oid
     OpRequestRef op,                 ///< [optional] client op
     ObjectContextRef *promote_obc = nullptr ///< [optional] new obc for object
+    );
+  /**
+   * This function will raise a promote request to cache pool if object is
+   * hot enough.
+   */
+  void maybe_request_promote(
+	  ObjectContextRef obc,
+    OpRequestRef op
     );
 
   int prepare_transaction(OpContext *ctx);

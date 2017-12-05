@@ -293,6 +293,7 @@ extern int ceph_release_from_features(uint64_t features);
 	f(CACHE_FLUSH,	__CEPH_OSD_OP(CACHE, DATA, 31),	"cache-flush")	    \
 	f(CACHE_EVICT,	__CEPH_OSD_OP(CACHE, DATA, 32),	"cache-evict")	    \
 	f(CACHE_TRY_FLUSH, __CEPH_OSD_OP(CACHE, DATA, 33), "cache-try-flush") \
+	f(CACHE_TRY_PROMOTE, __CEPH_OSD_OP(CACHE, DATA, 34), "cache-try-promote") \
 									    \
 	/* convert tmap to omap */					    \
 	f(TMAP2OMAP,	__CEPH_OSD_OP(RMW, DATA, 34),	"tmap2omap")	    \

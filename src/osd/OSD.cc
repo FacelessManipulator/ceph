@@ -9634,6 +9634,7 @@ int OSD::init_op_flags(OpRequestRef& op)
       break;
 
     case CEPH_OSD_OP_CACHE_TRY_FLUSH:
+    case CEPH_OSD_OP_CACHE_TRY_PROMOTE:
     case CEPH_OSD_OP_CACHE_FLUSH:
     case CEPH_OSD_OP_CACHE_EVICT:
       // If try_flush/flush/evict is the only op, can skip handle cache.

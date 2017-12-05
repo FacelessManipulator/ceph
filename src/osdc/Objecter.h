@@ -584,6 +584,27 @@ struct ObjectOperation {
       }
     }
   };
+  struct C_ObjectOperation_decodebaseline : public Context {
+    bufferlist bl;
+    uint32_t *baseline;
+    int *prval;
+    C_ObjectOperation_decodebaseline(uint32_t *b, int *pr)
+      : baseline(b), prval(pr) {}
+    void finish(int r) override {
+      if (r >= 0) {
+	bufferlist::iterator p = bl.begin();
+	try {
+	  uint64_t resp;
+	  ::decode(resp, p);
+	  if (baseline)
+	    *baseline = resp;
+	} catch (buffer::error& e) {
+	  if (prval)
+	    *prval = -EIO;
+	}
+      }
+    }
+  };
   void getxattrs(std::map<std::string,bufferlist> *pattrs, int *prval) {
     add_op(CEPH_OSD_OP_GETXATTRS);
     if (pattrs || prval) {
@@ -729,6 +750,7 @@ struct ObjectOperation {
     object_copy_cursor_t *cursor;
     uint64_t *out_size;
     ceph::real_time *out_mtime;
+    uint32_t *out_temp;
     std::map<std::string,bufferlist> *out_attrs;
     bufferlist *out_data, *out_omap_header, *out_omap_data;
     vector<snapid_t> *out_snaps;
@@ -744,6 +766,7 @@ struct ObjectOperation {
     C_ObjectOperation_copyget(object_copy_cursor_t *c,
 			      uint64_t *s,
 			      ceph::real_time *m,
+            uint32_t *t,
 			      std::map<std::string,bufferlist> *a,
 			      bufferlist *d, bufferlist *oh,
 			      bufferlist *o,
@@ -758,7 +781,7 @@ struct ObjectOperation {
 			      interval_set<uint64_t> *otextents,
 			      int *r)
       : cursor(c),
-	out_size(s), out_mtime(m),
+	out_size(s), out_mtime(m), out_temp(t),
 	out_attrs(a), out_data(d), out_omap_header(oh),
 	out_omap_data(o), out_snaps(osnaps), out_snap_seq(osnap_seq),
 	out_flags(flags), out_data_digest(dd), out_omap_digest(od),
@@ -784,6 +807,8 @@ struct ObjectOperation {
 	  *out_size = copy_reply.size;
 	if (out_mtime)
 	  *out_mtime = ceph::real_clock::from_ceph_timespec(copy_reply.mtime);
+  if (out_temp)
+    *out_temp = copy_reply.temp;
 	if (out_attrs)
 	  *out_attrs = copy_reply.attrs;
 	if (out_data)
@@ -823,6 +848,7 @@ struct ObjectOperation {
 		uint64_t max,
 		uint64_t *out_size,
 		ceph::real_time *out_mtime,
+    uint32_t *out_temp,
 		std::map<std::string,bufferlist> *out_attrs,
 		bufferlist *out_data,
 		bufferlist *out_omap_header,
@@ -844,7 +870,7 @@ struct ObjectOperation {
     unsigned p = ops.size() - 1;
     out_rval[p] = prval;
     C_ObjectOperation_copyget *h =
-      new C_ObjectOperation_copyget(cursor, out_size, out_mtime,
+      new C_ObjectOperation_copyget(cursor, out_size, out_mtime, out_temp,
 				    out_attrs, out_data, out_omap_header,
 				    out_omap_data, out_snaps, out_snap_seq,
 				    out_flags, out_data_digest,
@@ -1124,6 +1150,30 @@ struct ObjectOperation {
    */
   void cache_try_flush() {
     add_op(CEPH_OSD_OP_CACHE_TRY_FLUSH);
+  }
+
+  /**
+   * promote object to cache tier
+   *
+   * This is only used in TempTrack cachemode.
+   *
+   * If object dosen't exists in cache tier and is hot enough, promote it.
+   * If object is not hot enough, deny it
+   * If object exists in cache tier, this is a no-op.
+   *
+   * If promote started, return EAGAIN.
+   */
+  void cache_try_promote(uint32_t temp, uint32_t *evictline, int *prval) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_CACHE_TRY_PROMOTE);
+    ::encode(temp, osd_op.indata);
+    if (prval || evictline) {
+      unsigned p = ops.size() - 1;
+      C_ObjectOperation_decodebaseline *h = 
+	new C_ObjectOperation_decodebaseline(evictline, prval);
+      out_handler[p] = h;
+      out_bl[p] = &h->bl;
+      out_rval[p] = prval;
+    }
   }
 
   /**
