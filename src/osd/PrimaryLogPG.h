@@ -905,7 +905,9 @@ protected:
   void hit_set_clear();     ///< discard any HitSet state
   void hit_set_setup();     ///< initialize HitSet state
   void hit_set_create();    ///< create a new HitSet
+  bool hit_set_setup_base_temp();    ///< create a HitSet in basepool use TempHitSet
   void hit_set_persist();   ///< persist hit info
+  HitSetRef hit_set_load(hobject_t& oid); ///< load hitset by oid
   bool hit_set_apply_log(); ///< apply log entries to update in-memory HitSet
   void hit_set_trim(OpContextUPtr &ctx, unsigned max); ///< discard old HitSets
   void hit_set_in_memory_trim(uint32_t max_in_memory); ///< discard old in memory HitSets

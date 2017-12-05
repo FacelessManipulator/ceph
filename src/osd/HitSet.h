@@ -21,6 +21,7 @@
 #include "include/unordered_set.h"
 #include "common/bloom_filter.hpp"
 #include "common/hobject.h"
+#include "common/Clock.h"
 
 /**
  * generic container for a HitSet
@@ -36,7 +37,8 @@ public:
     TYPE_NONE = 0,
     TYPE_EXPLICIT_HASH = 1,
     TYPE_EXPLICIT_OBJECT = 2,
-    TYPE_BLOOM = 3
+    TYPE_BLOOM = 3,
+    TYPE_TEMP = 4
   } impl_type_t;
 
   static const char *get_type_name(impl_type_t t) {
@@ -45,6 +47,7 @@ public:
     case TYPE_EXPLICIT_HASH: return "explicit_hash";
     case TYPE_EXPLICIT_OBJECT: return "explicit_object";
     case TYPE_BLOOM: return "bloom";
+    case TYPE_TEMP: return "temp";
     default: return "???";
     }
   }
@@ -449,5 +452,184 @@ public:
   }
 };
 WRITE_CLASS_ENCODER(BloomHitSet)
+
+/**
+ * explicitly enumerate hash hits with incremental temp in the set
+ */
+class TempHitSet : public HitSet::Impl {
+public:
+  static const uint32_t TEMPMAX = UINT32_MAX * 0.9;
+
+  template <class T>
+  struct ExclusiveKeyAsHash {
+      size_t operator()(T key) const noexcept{
+        return key;
+      }
+  };
+
+  struct temp_info {
+    uint32_t temp;
+    uint32_t last_decay;
+
+    temp_info() : temp(0) {
+      last_decay = ceph_clock_now().tv.tv_sec;
+    }
+    temp_info(uint32_t t) {
+      temp = MIN(t, TEMPMAX);
+      last_decay = ceph_clock_now().tv.tv_sec;
+    }
+    temp_info(uint32_t t, uint32_t l) : last_decay(l) {
+      temp = MIN(t, TEMPMAX);
+    }
+    temp_info(const temp_info& ti) : last_decay(ti.last_decay) {
+      temp = MIN(ti.temp, TEMPMAX);
+    }
+
+    DENC(temp_info, v, p) {
+      DENC_START(1, 1, p);
+      denc_varint(v.temp, p);
+      denc(v.last_decay, p);
+      DENC_FINISH(p);
+    }
+  };
+
+private:
+  typedef ceph::unordered_map<
+    uint32_t, temp_info, ExclusiveKeyAsHash<unsigned>
+    > HitTable;
+
+  uint64_t count;
+  HitTable hits;
+  uint32_t decay_period;
+
+public:
+  class Params : public HitSet::Params::Impl {
+  public:
+    HitSet::impl_type_t get_type() const override {
+      return HitSet::TYPE_TEMP;
+    }
+    HitSet::Impl *get_new_impl() const override {
+      return new TempHitSet;
+    }
+
+    uint32_t decay_period;
+
+    Params()
+      : decay_period(1024) {}
+    Params(uint32_t dp)
+      : decay_period(dp) {}
+    Params(const Params &o)
+      : decay_period(o.decay_period) {}
+    ~Params() override {}
+
+    double get_dp() const {
+      return decay_period;
+    }
+    void set_dp(uint32_t dp) {
+      decay_period = MAX(1, dp);
+    }
+
+    void dump(Formatter *f) const override;
+    static void generate_test_instances(list<Params*>& o) {
+      o.push_back(new Params);
+    }
+  };
+
+  explicit TempHitSet() : count(0), decay_period(1024) {}
+  explicit TempHitSet(const TempHitSet::Params *p) : count(0) {
+    set_dp(p->get_dp());
+  }
+  TempHitSet(const TempHitSet &o) : count(o.count),
+      hits(o.hits) {}
+
+  HitSet::Impl *clone() const override {
+    return new TempHitSet(*this);
+  }
+
+  HitSet::impl_type_t get_type() const override {
+    return HitSet::TYPE_TEMP;
+  }
+  bool is_full() const override {
+    return false;
+  }
+  void set_dp(uint32_t dp) {
+    decay_period = dp;
+  }
+  void insert(const hobject_t &o) override {
+    HitTable::iterator it = hits.find(o.get_hash());
+    if (it == hits.end()) {
+      return;
+    } else {
+      update_temp(it->second);
+      (it->second.temp)++;
+    }
+  }
+  void insert(const hobject_t &o, temp_info& ti) {
+    HitTable::iterator it = hits.find(o.get_hash());
+    if (it == hits.end()) {
+      hits.emplace(o.get_hash(), ti);
+      ++count;
+    } else {
+      it->second = ti;
+    }
+  }
+  bool contains(const hobject_t& o) const override {
+    return hits.count(o.get_hash());
+  }
+  unsigned insert_count() const override {
+    return count;
+  }
+  unsigned approx_unique_insert_count() const override {
+    return hits.size();
+  }
+  uint32_t get_temp(const hobject_t& o) {
+    HitTable::iterator it = hits.find(o.get_hash());
+    if (it == hits.end())
+      return 0;
+    else {
+      update_temp(it->second);
+      return it->second.temp;
+    }
+  }
+  void evict_obj(const hobject_t& o) {
+    hits.erase(o.get_hash());
+  }
+  void encode(bufferlist &bl) const override {
+    ENCODE_START(1, 1, bl);
+    ::encode(count, bl);
+    ::encode(hits, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator &bl) override {
+    DECODE_START(1, bl);
+    ::decode(count, bl);
+    ::decode(hits, bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const override;
+  static void generate_test_instances(list<TempHitSet*>& o) {
+    o.push_back(new TempHitSet);
+    o.push_back(new TempHitSet);
+    o.back()->insert(hobject_t());
+    o.back()->insert(hobject_t("asdf", "", CEPH_NOSNAP, 123, 1, ""));
+    o.back()->insert(hobject_t("qwer", "", CEPH_NOSNAP, 456, 1, ""));
+  }
+
+private:
+  void update_temp(temp_info& t) {
+    utime_t now = ceph_clock_now();
+    assert(t.last_decay <= now.tv.tv_sec);
+    assert(decay_period > 0);
+    uint32_t periods = (now.tv.tv_sec - t.last_decay) / decay_period;
+    if (periods == 0)
+      t.temp = MIN(TEMPMAX, t.temp);
+    else {
+      t.temp >>= periods;
+      t.last_decay = now.tv.tv_sec;
+    }
+  }
+};
+WRITE_CLASS_DENC(TempHitSet::temp_info)
+WRITE_CLASS_ENCODER(TempHitSet)
 
 #endif

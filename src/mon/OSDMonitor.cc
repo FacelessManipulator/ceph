@@ -5825,6 +5825,11 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
 	p.hit_set_params = HitSet::Params(new ExplicitHashHitSet::Params);
       else if (val == "explicit_object")
 	p.hit_set_params = HitSet::Params(new ExplicitObjectHitSet::Params);
+      else if (val == "temperature") {
+	TempHitSet::Params *bsp = new TempHitSet::Params;
+	bsp->set_dp(g_conf->get_val<uint64_t>("osd_tier_default_cache_hit_set_period"));
+	p.hit_set_params = HitSet::Params(bsp);
+      }
       else {
 	ss << "unrecognized hit_set type '" << val << "'";
 	return -EINVAL;
@@ -10487,6 +10492,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       hsp = HitSet::Params(new ExplicitHashHitSet::Params);
     } else if (cache_hit_set_type == "explicit_object") {
       hsp = HitSet::Params(new ExplicitObjectHitSet::Params);
+    } else if (cache_hit_set_type == "temperature") {
+      hsp = HitSet::Params(new TempHitSet::Params);
     } else {
       ss << "osd tier cache default hit set type '"
 	 << cache_hit_set_type << "' is not a known type";
