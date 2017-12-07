@@ -2171,12 +2171,17 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
         in_hit_set = true;
     }
     if (!op->hitset_inserted) {
-      hit_set->insert(oid);
       op->hitset_inserted = true;
-      if (hit_set->impl->get_type() == HitSet::TYPE_TEMP){
+      if (hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
         TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+        if (pool.info.write_tier >= 0)
+          hit_set->insert(oid, true);
+        else
+          hit_set->insert(oid, false);
         dout(20) << __func__ << ": TempHitSet hit "  << oid
           << " temp: " << th->get_temp(oid) << dendl;
+      } else {
+        hit_set->insert(oid);
       }
       if (hit_set->is_full() ||
           hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {

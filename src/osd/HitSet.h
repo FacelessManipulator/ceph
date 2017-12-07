@@ -556,9 +556,14 @@ public:
     decay_period = dp;
   }
   void insert(const hobject_t &o) override {
+    insert(o, false);
+  }
+  void insert(const hobject_t &o, bool created) {
     HitTable::iterator it = hits.find(o.get_hash());
     if (it == hits.end()) {
-      return;
+      if (!created)
+        return;
+      hits.emplace(o.get_hash(), 1);
     } else {
       update_temp(it->second);
       (it->second.temp)++;
