@@ -949,6 +949,8 @@ protected:
   bool agent_choose_mode(bool restart = false, OpRequestRef op = OpRequestRef());
   void agent_choose_mode_restart() override;
 
+  bool maybe_cachemode_temptrack();
+
   /// true if we can send an ondisk/commit for v
   bool already_complete(eversion_t v);
   /// true if we can send an ack for v

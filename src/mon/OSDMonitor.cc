@@ -5825,11 +5825,6 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
 	p.hit_set_params = HitSet::Params(new ExplicitHashHitSet::Params);
       else if (val == "explicit_object")
 	p.hit_set_params = HitSet::Params(new ExplicitObjectHitSet::Params);
-      else if (val == "temperature") {
-	TempHitSet::Params *bsp = new TempHitSet::Params;
-	bsp->set_dp(g_conf->get_val<uint64_t>("osd_tier_default_cache_hit_set_period"));
-	p.hit_set_params = HitSet::Params(bsp);
-      }
       else {
 	ss << "unrecognized hit_set type '" << val << "'";
 	return -EINVAL;
@@ -10340,6 +10335,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
      *  readforward: Writes are in writeback mode, Reads are in forward mode
      *  proxy:       Proxy all reads and writes to base pool
      *  readproxy:   Writes are in writeback mode, Reads are in proxy mode
+     *  temptrack:   Proxy all reads and writes, promote and evict based on temperature
      *
      * Hence, these are the allowed transitions:
      *
@@ -10410,6 +10406,15 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
         goto reply;
       }
     }
+
+    if (mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+      err = check_cluster_features(CEPH_FEATURE_NEW_OSD_PROXY_TEMP_TRACK, ss);
+      if (err == -EAGAIN)
+        goto wait;
+      if (err)
+        goto reply;
+    }
+
     // go
     pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
     np->cache_mode = mode;
@@ -10424,6 +10429,10 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       if (base_pool->read_tier == pool_id ||
 	  base_pool->write_tier == pool_id)
 	ss <<" (WARNING: pool is still configured as read or write tier)";
+    } else if (mode ==  pg_pool_t::CACHEMODE_TEMPTRACK) {
+      const pg_pool_t *base_pool = osdmap.get_pg_pool(np->tier_of);
+      assert(base_pool);
+      pending_inc.get_new_pool(np->tier_of, base_pool);
     }
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
 					      get_last_committed() + 1));
@@ -10492,8 +10501,6 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       hsp = HitSet::Params(new ExplicitHashHitSet::Params);
     } else if (cache_hit_set_type == "explicit_object") {
       hsp = HitSet::Params(new ExplicitObjectHitSet::Params);
-    } else if (cache_hit_set_type == "temperature") {
-      hsp = HitSet::Params(new TempHitSet::Params);
     } else {
       ss << "osd tier cache default hit set type '"
 	 << cache_hit_set_type << "' is not a known type";

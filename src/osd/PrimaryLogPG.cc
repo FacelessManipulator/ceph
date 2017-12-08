@@ -2175,9 +2175,9 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       if (hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
         TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
         if (pool.info.write_tier >= 0)
-          hit_set->insert(oid, true);
+          th->insert(oid, true);
         else
-          hit_set->insert(oid, false);
+          th->insert(oid, false);
         dout(20) << __func__ << ": TempHitSet hit "  << oid
           << " temp: " << th->get_temp(oid) << dendl;
       } else {
@@ -2617,6 +2617,9 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
     // If it is a read, we can read, we need to proxy it
     do_proxy_read(op);
     return cache_result_t::HANDLED_PROXY;
+
+    case pg_pool_t::CACHEMODE_TEMPTRACK:
+    return cache_result_t::NOOP;
 
   default:
     assert(0 == "unrecognized cache_mode");
@@ -10846,7 +10849,7 @@ void PrimaryLogPG::on_activate()
 	     << dendl;
     }
   }
-
+  maybe_cachemode_temptrack();
   hit_set_setup();
   agent_setup();
 }
@@ -10993,6 +10996,7 @@ void PrimaryLogPG::on_pool_change()
     requeue_ops(waiting_for_cache_not_full);
     objects_blocked_on_cache_full.clear();
   }
+  maybe_cachemode_temptrack();
   hit_set_setup();
   agent_setup();
 }
@@ -12247,6 +12251,30 @@ void PrimaryLogPG::check_local()
   }
 }
 
+bool PrimaryLogPG::maybe_cachemode_temptrack()
+{
+  if (pool.info.cache_mode != pg_pool_t::CACHEMODE_TEMPTRACK &&
+    pool.info.write_tier < 0)
+    return false;
+
+  OSDMapRef osdmap = get_osdmap();
+
+  const pg_pool_t* write_tier = osdmap->get_pg_pool(pool.info.write_tier);
+  if (write_tier && write_tier->cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    pool.info.cache_mode = pg_pool_t::CACHEMODE_TEMPTRACK;
+    dout(20) << __func__ << "base pool: " << pool.name
+      << " initialize TEMPTRACK cachemode for"
+      << " its write tier: " << osdmap->get_pool_name(pool.info.write_tier)
+      << dendl;
+  }
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    TempHitSet::Params *bsp = new TempHitSet::Params;
+    bsp->set_dp(cct->_conf->osd_agent_hist_halflife);
+    pool.info.hit_set_params = HitSet::Params(bsp);
+    return true;
+  }
+  return false;
+}
 
 
 // ===========================
@@ -12292,16 +12320,6 @@ void PrimaryLogPG::hit_set_clear()
 
 void PrimaryLogPG::hit_set_setup()
 {
-  bool write_tier_temp = false;
-
-  if (pool.info.write_tier >= 0) {
-    const pg_pool_t* write_tier = get_osdmap()->get_pg_pool(pool.info.write_tier);
-    if (write_tier != NULL &&
-        write_tier->hit_set_params.get_type() == HitSet::TYPE_TEMP) {
-      write_tier_temp = true;
-    }
-  }
-
   if (!is_active() ||
       !is_primary()) {
     hit_set_clear();
@@ -12309,7 +12327,6 @@ void PrimaryLogPG::hit_set_setup()
   }
 
   if (is_active() && is_primary() &&
-      !write_tier_temp &&
       (!pool.info.hit_set_count ||
        !pool.info.hit_set_period ||
        pool.info.hit_set_params.get_type() == HitSet::TYPE_NONE)) {
@@ -12415,74 +12432,14 @@ void PrimaryLogPG::hit_set_create()
     if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
       TempHitSet* ht =
         static_cast<TempHitSet*>(hit_set->impl.get());
-      ht->set_dp(pool.info.hit_set_period);
+      ht->set_dp(cct->_conf->osd_agent_hist_halflife);
       return;
     }
-    TempHitSet::Params *p = 
-      static_cast<TempHitSet::Params*>(params.impl.get());
-    p->set_dp(pool.info.hit_set_period);
-    dout(10) << __func__ << " decay_period " << p->get_dp() << dendl;
-  } else if(pool.info.write_tier >= 0) {
-    if (!hit_set_setup_base_temp())
-      hit_set.reset();
-    return;
   }
   hit_set.reset(new HitSet(params));
   hit_set_start_stamp = now;
 }
 
-/**
-* create a TempHitSet in base pool
-* 
-* this would only happen when cache pool's hit set mode is temperature
-* to store the temp_info of cold object.
-* If there shouldn't be a hit set, reture false
-*/
-bool PrimaryLogPG::hit_set_setup_base_temp()
-{
-  if (pool.info.write_tier < 0) {
-    dout(20) << __func__ << " can't create TempHitSet without overlay " 
-      << " pool:" << pool.info
-      << dendl;
-    return false;
-  }
-  const pg_pool_t* write_tier = get_osdmap()->get_pg_pool(pool.info.write_tier);
-  if (!write_tier) {
-    dout(20) << __func__ << " can't find the overlay in osdmap. continue. "
-      << dendl;
-    return false;
-  }
-  else if (write_tier->hit_set_params.get_type() != HitSet::TYPE_TEMP) {
-    dout(20) << __func__ << " overlay's hit set mode isn't TempHitSet. skipped. "
-      << "overlay:" << write_tier
-      << dendl;
-    return false;
-  }
-
-  if (!hit_set) {
-    // try loading the temp hit set in local storage first
-    hobject_t oid = get_hit_set_current_object(utime_t());
-    hit_set = hit_set_load(oid);
-  }
-
-  if (!hit_set || hit_set->impl->get_type() != HitSet::TYPE_TEMP) {
-    utime_t now = ceph_clock_now();
-    HitSet::Params params(write_tier->hit_set_params);
-    TempHitSet::Params *p = 
-      static_cast<TempHitSet::Params*>(params.impl.get());
-    p->set_dp(write_tier->hit_set_period);
-    hit_set.reset(new HitSet(params));
-    hit_set_start_stamp = now;
-    dout(10) << __func__ << " created TempHitSet in base pool." << dendl;
-    return true;
-  }
-  else {
-    TempHitSet* ht =
-      static_cast<TempHitSet*>(hit_set->impl.get());
-    ht->set_dp(write_tier->hit_set_period);
-    return true;
-  }
-}
 
 /**
  * apply log entries to set
@@ -12545,8 +12502,7 @@ void PrimaryLogPG::hit_set_persist()
 
   pg_hit_set_info_t new_hset(pool.info.use_gmt_hitset);
 
-  if (pool.info.hit_set_params.get_type() == HitSet::TYPE_TEMP ||
-    pool.info.write_tier >= 0) {
+  if (pool.info.hit_set_params.get_type() == HitSet::TYPE_TEMP) {
     // the count of TempHitSet should be 1
     max = 1;
     hobject_t aoid = get_hit_set_current_object(utime_t());
@@ -12659,8 +12615,7 @@ void PrimaryLogPG::hit_set_persist()
       0)
     );
 
-  if (pool.info.hit_set_params.get_type() != HitSet::TYPE_TEMP &&
-    pool.info.write_tier < 0)
+  if (pool.info.hit_set_params.get_type() != HitSet::TYPE_TEMP)
     hit_set_trim(ctx, max);
 
   simple_opc_submit(std::move(ctx));
