@@ -2619,7 +2619,23 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_cache_detail(
     return cache_result_t::HANDLED_PROXY;
 
     case pg_pool_t::CACHEMODE_TEMPTRACK:
-    return cache_result_t::NOOP;
+      if (!must_promote) {
+        if (op->may_write() || op->may_cache() || write_ordered) {
+          do_proxy_write(op);
+          return cache_result_t::HANDLED_PROXY;
+        } else {
+          do_proxy_read(op);
+          return cache_result_t::HANDLED_PROXY;
+        }
+      }
+      if (agent_state &&
+        agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
+        dout(20) << __func__ << " cache pool full, waiting" << dendl;
+        block_write_on_full_cache(missing_oid, op);
+        return cache_result_t::BLOCKED_FULL;
+      }
+      promote_object(obc, missing_oid, oloc, op, promote_obc);
+      return cache_result_t::BLOCKED_PROMOTE;
 
   default:
     assert(0 == "unrecognized cache_mode");
@@ -8510,6 +8526,14 @@ void PrimaryLogPG::finish_promote(int r, CopyResults *results,
 
   osd->logger->inc(l_osd_tier_promote);
 
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    // TODO: get the temp_info from result data and insert into histgram.
+    if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+      TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+      th->insert(soid, 1);
+    }
+  }
+
   if (agent_state &&
       agent_state->is_idle())
     agent_choose_mode();
@@ -12270,6 +12294,8 @@ bool PrimaryLogPG::maybe_cachemode_temptrack()
   if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
     TempHitSet::Params *bsp = new TempHitSet::Params;
     bsp->set_dp(cct->_conf->osd_agent_hist_halflife);
+    pool.info.hit_set_count = 1;
+    pool.info.hit_set_period = UINT32_MAX;
     pool.info.hit_set_params = HitSet::Params(bsp);
     return true;
   }
@@ -13102,7 +13128,15 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   finish_ctx(ctx.get(), pg_log_entry_t::DELETE);
   simple_opc_submit(std::move(ctx));
   osd->logger->inc(l_osd_tier_evict);
-  osd->logger->inc(l_osd_agent_evict);
+  osd->logger->inc(l_osd_agent_evict);  
+
+  if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+    // TODO: get the temp_info from result data and insert into histgram.
+    if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+      TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+      th->evict(soid);
+    }
+  }
   return true;
 }
 

@@ -596,7 +596,7 @@ public:
       return it->second.temp;
     }
   }
-  void evict_obj(const hobject_t& o) {
+  void evict(const hobject_t& o) {
     hits.erase(o.get_hash());
   }
   void encode(bufferlist &bl) const override {
