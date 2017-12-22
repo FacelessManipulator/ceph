@@ -493,6 +493,10 @@ public:
     }
   };
 
+  struct temp_stats {
+    int promote_request_skipped;
+  };
+
   class RankHistogram {
     std::vector<int32_t> h; // savepoint histogram
     std::vector<int32_t> present; // present histogram
@@ -649,6 +653,7 @@ public:
   uint32_t baseline;
   uint32_t old_avg_temp;
   uint32_t exp_avg_temp;
+  temp_stats stats;
 
 public:
   class Params : public HitSet::Params::Impl {

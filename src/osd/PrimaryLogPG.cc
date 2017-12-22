@@ -2174,21 +2174,20 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
       op->hitset_inserted = true;
       if (hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
         TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
-        if (!obc || !obc->obs.exists)
-          th->evict(oid);
-        else if (pool.info.is_tier())
-          th->insert(oid, true);
+        bool exsited = obc.get() && obc->obs.exists;
+        if (pool.info.is_tier())
+          th->insert(oid, exsited);
         else
-          th->insert(oid, true);
+          th->insert(oid, exsited || can_create);
         th->update();
         uint64_t cache_hit_micro = th->get_cache_hit_micro();
         dout(20) << __func__ << ": TempHitSet hit "  << oid
           << " temp: " << th->get_temp(oid)
           << " TempHitSet Stats["
           << " average temp: " << th->get_avg_temp()
-          << ", decay periods: " << th->decay_period
+          << ", baseline: " << th->baseline
           << ", hit/miss: " << th->cache_hit << "/" << th->count - th->cache_hit
-          << ", hit rate" << (float)cache_hit_micro / 1000000
+          << ", hit rate: " << (float)cache_hit_micro / 1000000
           << " ]" << dendl;
       } else {
         hit_set->insert(oid);
@@ -3184,11 +3183,13 @@ void PrimaryLogPG::maybe_request_promote(ObjectContextRef obc,
   hobject_t hoid = obc->obs.oi.soid;
   TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
   uint32_t temp = th->get_temp(hoid);
-  if (temp > 2) {
+  if (temp > th->baseline || th->stats.promote_request_skipped > 10) {
     ObjectOperation op;
     op.cache_try_promote(temp, &(th->baseline), NULL);
     osd->objecter->read(hoid.oid, oloc, op, hoid.snap, NULL, 0, NULL);
-      //TODO: continuing
+    th->stats.promote_request_skipped = 0;
+  } else {
+    th->stats.promote_request_skipped++;
   }
 }
 
@@ -5326,16 +5327,23 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  goto fail;
 	}
-	//agent_state->temp_hist.get_position_micro(temp, &temp_lower, &temp_upper);
-	if (temp > 2) {
-	  ::encode(2, osd_op.outdata);
-    dout(0) << __func__ << "try promoting object with temp " << temp << dendl;
+	uint32_t promote_line = 0;
+	if (pool.info.target_max_objects &&
+	    info.stats.stats.sum.num_objects * 2> pool.info.target_max_objects)
+	  if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+	    TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+	    promote_line = th->get_micro_temp(info.stats.stats.sum.num_objects * 2000000 / pool.info.target_max_objects);
+	    th->baseline = promote_line;
+	  }
+	if (temp > promote_line) {
+	  ::encode(promote_line, osd_op.outdata);
+
 	  const MOSDOp *m = static_cast<const MOSDOp *>(ctx->op->get_req());
 	  const object_locator_t oloc = m->get_object_locator();
 	  promote_object(ctx->obc, soid, oloc, ctx->op, nullptr);
 	  result = -EAGAIN;
 	} else {
-	  ::encode(3, osd_op.outdata);
+	  ::encode(promote_line, osd_op.outdata);
 	  result = 0;
 	}
       }

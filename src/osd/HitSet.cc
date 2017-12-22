@@ -293,14 +293,17 @@ void TempHitSet::update() {
     count = count >> periods;
     cache_hit = cache_hit >> periods;
     last_decay = now_sec;
-    uint32_t cur_avg_temp = get_avg_temp();
-    // if the avg temperature didn't increase as expected
-    if ((cbits(cur_avg_temp) > cbits(old_avg_temp)) !=
-        (exp_avg_temp > cur_avg_temp)) {
-      decay_period = decay_period * exp_avg_temp / MAX(1, cur_avg_temp);
-      decay_period = MAX(decay_period, 1);
-      rh->set_dp(decay_period);
-    }
+    // uint32_t cur_avg_temp = get_avg_temp();
+    // // if the avg temperature didn't increase as expected
+    // if ((cbits(cur_avg_temp) > cbits(old_avg_temp)) !=
+    //     (exp_avg_temp > cur_avg_temp)) {
+    //   decay_period *= (exp_avg_temp > cur_avg_temp ? 1.1 : 0.9);
+    //   decay_period = MAX(10, decay_period);
+    //   // decay_period = decay_period * exp_avg_temp / MAX(1, cur_avg_temp);
+    //   // decay_period = MAX(decay_period, 1);
+    //   // rh->set_dp(decay_period);
+    // }
+    // old_avg_temp = cur_avg_temp;
   }
 }
 
