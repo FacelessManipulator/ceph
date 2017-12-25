@@ -532,6 +532,7 @@ public:
       void clear(uint32_t time) {
 	h.clear();
 	present.clear();
+        total = 0;
 	fresh_p = false;
 	last_decay_c = time / period;
 	last_decay_r = 0;
@@ -567,7 +568,9 @@ public:
 
       void sub(uint32_t v) {
 	unsigned bin = cbits(v);
-	if (bin + 1 <= h.size()) {
+	if (total > 0 &&
+      bin + 1 <= h.size() &&
+      h[bin] > 0) {
 	  h[bin]--;
 	  total--;
 	  _contract();
@@ -615,16 +618,34 @@ public:
 	return true;
       }
 
-      uint32_t get_micro_value(uint64_t m) {
-	int64_t target = m * total  / 1000000;
+      uint32_t get_position_value(uint64_t m) {
+        if (m >= total)
+          return 0;
+	int64_t target = total - m;
 	uint32_t pos = 1;
 	for (auto p = present.begin(); p != present.end(); ++p) {
-	  target -= *p;
-	  if (target <= 0)
-	    break;
+          target -= *p;
+	  if (target <= 0) {
+                pos += target * MAX(pos/2 ,1) / MAX(1, *p);
+                break;
+          }
 	  pos <<= 1;
 	}
 	return pos;
+      }
+
+      uint64_t get_value_position(uint32_t v) {
+        int64_t lower = 0;
+        uint32_t pos = 1;
+        for (auto p = present.begin(); p!= present.end(); ++p) {
+          if (v < pos) {
+                // lower += (*p) * (v - pos / 2) / MAX(pos / 2, 1);
+                break;
+          }
+          pos <<= 1;
+          lower += *p;
+      	}
+        return total - lower;
       }
       uint32_t get_avg() {
 	float avg  = 0;
@@ -763,9 +784,14 @@ public:
     rh->sub(it->second.temp);
     hits.erase(it);
   }
-  uint32_t get_micro_temp(uint64_t m) {
+  uint32_t get_rank_temp(uint64_t m) {
     rh->fresh_present(ceph_clock_now().tv.tv_sec);
-    return rh->get_micro_value(m);
+    return rh->get_position_value(m);
+  }
+  uint64_t get_oid_rank(const hobject_t& o) {
+    rh->fresh_present(ceph_clock_now().tv.tv_sec);
+    uint32_t temp = get_temp(o);
+    return rh->get_value_position(temp);
   }
   uint32_t get_avg_temp() {
     rh->fresh_present(ceph_clock_now().tv.tv_sec);
@@ -775,8 +801,10 @@ public:
     update();
     return (cache_hit + 1) * 1000000 / (count + 1);
   }
-  // sync the rank histogram and update the decay periods
+  // update the decay periods
   void update();
+  // sync the temperature and rank histogram
+  void sync();
 
   void encode(bufferlist &bl) const override {
     ENCODE_START(1, 1, bl);

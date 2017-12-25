@@ -5327,23 +5327,21 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  goto fail;
 	}
-	uint32_t promote_line = 0;
-	if (pool.info.target_max_objects &&
-	    info.stats.stats.sum.num_objects * 2> pool.info.target_max_objects)
-	  if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
-	    TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
-	    promote_line = th->get_micro_temp(info.stats.stats.sum.num_objects * 2000000 / pool.info.target_max_objects);
-	    th->baseline = promote_line;
-	  }
-	if (temp > promote_line) {
-	  ::encode(promote_line, osd_op.outdata);
+  uint32_t promote_temp = 0;
+  if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+    TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+    promote_temp = th->baseline;
+  }
+	if (temp > promote_temp &&
+      agent_state->promote_mode == TierAgentState::PROMOTE_MODE_WARMING) {
+	  ::encode(promote_temp, osd_op.outdata);
 
 	  const MOSDOp *m = static_cast<const MOSDOp *>(ctx->op->get_req());
 	  const object_locator_t oloc = m->get_object_locator();
 	  promote_object(ctx->obc, soid, oloc, ctx->op, nullptr);
-	  result = -EAGAIN;
+	  result = 0;
 	} else {
-	  ::encode(promote_line, osd_op.outdata);
+	  ::encode(promote_temp, osd_op.outdata);
 	  result = 0;
 	}
       }
@@ -12545,9 +12543,10 @@ void PrimaryLogPG::hit_set_create()
     }
     // No need to create a new temp_hit_set if cur temp_hit_set exist
     if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
-      TempHitSet* ht =
+      TempHitSet* th =
         static_cast<TempHitSet*>(hit_set->impl.get());
-      ht->set_dp(cct->_conf->osd_agent_hist_halflife);
+      th->set_dp(cct->_conf->osd_agent_hist_halflife);
+      th->sync();
       hit_set_start_stamp = now;
       return;
     }
@@ -13161,29 +13160,38 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
       return false;
     }
     // is this object old and/or cold enough?
-    int temp = 0;
-    uint64_t temp_upper = 0, temp_lower = 0;
-    if (hit_set)
-      agent_estimate_temp(soid, &temp);
-    agent_state->temp_hist.add(temp);
-    agent_state->temp_hist.get_position_micro(temp, &temp_lower, &temp_upper);
+    if (pool.info.cache_mode == pg_pool_t::CACHEMODE_TEMPTRACK) {
+      TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+      uint64_t rank = th->get_oid_rank(soid);
+      if (rank < agent_state->evict_rank)
+	return false;
+      dout(20) << __func__
+  << " rank " << rank << dendl;
+    } else {
+      int temp = 0;
+      uint64_t temp_upper = 0, temp_lower = 0;
+      if (hit_set)
+	agent_estimate_temp(soid, &temp);
+      agent_state->temp_hist.add(temp);
+      agent_state->temp_hist.get_position_micro(temp, &temp_lower, &temp_upper);
 
-    dout(20) << __func__
-	     << " temp " << temp
-	     << " pos " << temp_lower << "-" << temp_upper
-	     << ", evict_effort " << agent_state->evict_effort
-	     << dendl;
-    dout(30) << "agent_state:\n";
-    Formatter *f = Formatter::create("");
-    f->open_object_section("agent_state");
-    agent_state->dump(f);
-    f->close_section();
-    f->flush(*_dout);
-    delete f;
-    *_dout << dendl;
+      dout(20) << __func__
+	<< " temp " << temp
+	<< " pos " << temp_lower << "-" << temp_upper
+	<< ", evict_effort " << agent_state->evict_effort
+	<< dendl;
+      dout(30) << "agent_state:\n";
+      Formatter *f = Formatter::create("");
+      f->open_object_section("agent_state");
+      agent_state->dump(f);
+      f->close_section();
+      f->flush(*_dout);
+      delete f;
+      *_dout << dendl;
 
-    if (1000000 - temp_upper >= agent_state->evict_effort)
-      return false;
+      if (1000000 - temp_upper >= agent_state->evict_effort)
+	return false;
+    }
   }
 
   dout(10) << __func__ << " evicting " << obc->obs.oi << dendl;
@@ -13408,6 +13416,24 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
     assert(evict_effort >= inc && evict_effort <= 1000000);
     dout(30) << __func__ << " evict_effort " << was << " quantized by " << inc << " to " << evict_effort << dendl;
   }
+
+  if (pool.info.target_max_objects)
+    agent_state->evict_rank = pool.info.target_max_objects * evict_target /	1000000 / pool.info.get_pg_num_divisor(info.pgid.pgid);
+  else
+    agent_state->evict_rank = num_user_objects;
+
+  // promote mode
+  if (full_micro > (evict_target + 1000000) / 2)
+    agent_state->promote_mode = TierAgentState::PROMOTE_MODE_FULL;
+  else
+    agent_state->promote_mode = TierAgentState::PROMOTE_MODE_WARMING;
+
+  if (hit_set && hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+    TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
+    uint32_t promote_threshold = 0.9 * agent_state->evict_rank;
+    th->baseline = th->get_rank_temp(promote_threshold);
+  }
+
   }
 
   skip_calc:

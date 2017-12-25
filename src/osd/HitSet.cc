@@ -307,6 +307,15 @@ void TempHitSet::update() {
   }
 }
 
+void TempHitSet::sync() {
+  std::vector<uint32_t> temps;
+  for (HitTable::iterator it = hits.begin(); it != hits.end(); ++it) {
+    _update_temp(it->second);
+    temps.push_back(it->second.temp);
+  }
+  rh->sync(temps.begin(), temps.end(), ceph_clock_now().tv.tv_sec);
+}
+
 void TempHitSet::Params::dump(Formatter *f) const {
   f->dump_unsigned("object temperature decay period", get_dp());
 }
