@@ -2173,6 +2173,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     if (!op->hitset_inserted) {
       op->hitset_inserted = true;
       if (hit_set->impl->get_type() == HitSet::TYPE_TEMP) {
+        if (op->get_reqid().name.is_client()){
         TempHitSet* th = static_cast<TempHitSet*>(hit_set->impl.get());
         bool exsited = obc.get() && obc->obs.exists;
         if (pool.info.is_tier())
@@ -2189,6 +2190,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
           << ", hit/miss: " << th->cache_hit << "/" << th->count - th->cache_hit
           << ", hit rate: " << (float)cache_hit_micro / 1000000
           << " ]" << dendl;
+        }
       } else {
         hit_set->insert(oid);
       }
