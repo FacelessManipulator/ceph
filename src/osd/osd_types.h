@@ -1159,7 +1159,6 @@ struct pg_pool_t {
     FLAG_BACKFILLFULL = 1<<12, // pool is backfillfull
     FLAG_SELFMANAGED_SNAPS = 1<<13, // pool uses selfmanaged snaps
     FLAG_POOL_SNAPS = 1<<14,        // pool has pool snaps
-    FLAG_POOL_TEMPERATURE = 1<<15,        // pool has temperature
   };
 
   static const char *get_flag_name(int f) {
@@ -1179,7 +1178,6 @@ struct pg_pool_t {
     case FLAG_BACKFILLFULL: return "backfillfull";
     case FLAG_SELFMANAGED_SNAPS: return "selfmanaged_snaps";
     case FLAG_POOL_SNAPS: return "pool_snaps";
-    case FLAG_POOL_TEMPERATURE: return "pool_tmeperature";
     default: return "???";
     }
   }
@@ -1228,8 +1226,6 @@ struct pg_pool_t {
       return FLAG_SELFMANAGED_SNAPS;
     if (name == "pool_snaps")
       return FLAG_POOL_SNAPS;
-    if (name == "pool_tmeperature")
-      return FLAG_POOL_TEMPERATURE;
     return 0;
   }
 
@@ -1244,7 +1240,7 @@ struct pg_pool_t {
     CACHEMODE_READFORWARD = 4,           ///< forward reads, write to cache flush later
     CACHEMODE_READPROXY = 5,             ///< proxy reads, write to cache flush later
     CACHEMODE_PROXY = 6,                 ///< proxy if not in cache
-    CACHEMODE_TEMPTRACK = 7,             ///< proxy depends on temperature
+    CACHEMODE_SWAP = 7,             ///< swap the hot object with cold object in cache tier
   } cache_mode_t;
   static const char *get_cache_mode_name(cache_mode_t m) {
     switch (m) {
@@ -1255,7 +1251,7 @@ struct pg_pool_t {
     case CACHEMODE_READFORWARD: return "readforward";
     case CACHEMODE_READPROXY: return "readproxy";
     case CACHEMODE_PROXY: return "proxy";
-    case CACHEMODE_TEMPTRACK: return "temptrack";
+    case CACHEMODE_SWAP: return "swap";
     default: return "unknown";
     }
   }
@@ -1274,8 +1270,8 @@ struct pg_pool_t {
       return CACHEMODE_READPROXY;
     if (s == "proxy")
       return CACHEMODE_PROXY;
-    if (s == "temptrack")
-      return CACHEMODE_TEMPTRACK;
+    if (s == "swap")
+      return CACHEMODE_SWAP;
     return (cache_mode_t)-1;
   }
   const char *get_cache_mode_name() const {
@@ -1291,7 +1287,7 @@ struct pg_pool_t {
     case CACHEMODE_WRITEBACK:
     case CACHEMODE_READFORWARD:
     case CACHEMODE_READPROXY:
-    case CACHEMODE_TEMPTRACK:
+    case CACHEMODE_SWAP:
       return true;
     default:
       assert(0 == "implement me");

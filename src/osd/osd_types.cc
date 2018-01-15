@@ -1532,12 +1532,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     ::encode(read_tier, bl);
     ::encode(write_tier, bl);
     ::encode(properties, bl);
-    // prevent the crashes of old version client when decode hit_set_params
-    if (hit_set_params.get_type() == HitSet::TYPE_TEMP) {
-      ::encode(HitSet::Params(nullptr), bl);
-    } else {
-      ::encode(hit_set_params, bl);
-    }
+    ::encode(hit_set_params, bl);
     ::encode(hit_set_period, bl);
     ::encode(hit_set_count, bl);
     ::encode(stripe_width, bl);
@@ -1596,12 +1591,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(read_tier, bl);
   ::encode(write_tier, bl);
   ::encode(properties, bl);
-  // prevent the crashes of old version client when decode hit_set_params
-  if (hit_set_params.get_type() == HitSet::TYPE_TEMP) {
-    ::encode(HitSet::Params(nullptr), bl);
-  } else {
-    ::encode(hit_set_params, bl);
-  }
+  ::encode(hit_set_params, bl);
   ::encode(hit_set_period, bl);
   ::encode(hit_set_count, bl);
   ::encode(stripe_width, bl);
@@ -1711,12 +1701,7 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
     ::decode(properties, bl);
   }
   if (struct_v >= 11) {
-    // prevent the crashes of old version client when decode hit_set_params
     ::decode(hit_set_params, bl);
-    if ((flags & FLAG_POOL_TEMPERATURE) == FLAG_POOL_TEMPERATURE &&
-        hit_set_params.get_type() == HitSet::TYPE_NONE) {
-      hit_set_params = HitSet::Params(new TempHitSet::Params);
-    }
     ::decode(hit_set_period, bl);
     ::decode(hit_set_count, bl);
   } else {
