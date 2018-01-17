@@ -673,14 +673,14 @@ public:
 
   void encode(bufferlist &bl) const override {
     ENCODE_START(1, 1, bl);
-    ::encode(hits, bl);
-    ::encode(last_decay, bl);
+    encode(hits, bl);
+    encode(last_decay, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator &bl) override {
     DECODE_START(1, bl);
-    ::decode(hits, bl);
-    ::decode(last_decay, bl);
+    decode(hits, bl);
+    decode(last_decay, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const override;

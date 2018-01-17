@@ -228,7 +228,7 @@ public:
       if ((features & CEPH_FEATURE_NEW_OSD_PROXY_TEMP_TRACK) == 0) {
         header.version = 9;
       } else {
-        ::encode(temperature, payload);
+        encode(temperature, payload);
       }
     }
   }
@@ -264,7 +264,7 @@ public:
 	decode(redirect, p);
       decode(qos_resp, p);
       decode_trace(p);
-      ::decode(temperature, p);
+      decode(temperature, p);
     } else if (header.version < 2) {
       ceph_osd_reply_head head;
       decode(head, p);
@@ -331,7 +331,7 @@ public:
         decode_trace(p);
       }
       if (header.version >= 10) {
-        ::decode(temperature, p);
+        decode(temperature, p);
       }
     }
   }
